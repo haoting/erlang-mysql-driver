@@ -482,6 +482,8 @@ get_result_affected_rows(#mysql_result{affectedrows=AffectedRows}) ->
 %% @spec get_result_reason(MySQLRes::mysql_result()) ->
 %%    Reason::string()
 get_result_reason(#mysql_result{error=Reason}) ->
+    Reason;
+get_result_reason(Reason) ->
     Reason.
 
 %% @doc Extract the Insert Id from MySQL Result on update
@@ -507,7 +509,7 @@ init([PoolId, Host, Port, User, Password, Database, LogFun, Encoding]) ->
 			    Database, Encoding),
 	    State = #state{log_fun = LogFun1},
 	    {ok, add_conn(Conn, State)};
-	{error, Reason} ->
+	{error, _Reason} ->
 	    ?Log(LogFun1, error,
 		 "failed starting first MySQL connection handler, "
 		 "exiting"),

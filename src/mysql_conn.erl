@@ -77,7 +77,9 @@
 	 execute/5,
 	 execute/6,
 	 transaction/3,
-	 transaction/4
+	 transaction/4,
+	 close/2,
+	 close/3
 	]).
 
 %% private exports to be called only from the 'mysql' module
@@ -109,6 +111,7 @@
 
 -define(SECURE_CONNECTION, 32768).
 -define(MYSQL_QUERY_OP, 3).
+-define(MYSQL_CLOSE_OP, 1).
 -define(DEFAULT_STANDALONE_TIMEOUT, 5000).
 -define(MYSQL_4_0, 40). %% Support for MySQL 4.0.x
 -define(MYSQL_4_1, 41). %% Support for MySQL 4.1.x et 5.0.x
@@ -214,6 +217,12 @@ fetch(Pid, Queries, From) ->
 fetch(Pid, Queries, From, Timeout)  ->
     do_fetch(Pid, Queries, From, Timeout).
 
+close(Pid, From) ->
+    close(Pid, From, ?DEFAULT_STANDALONE_TIMEOUT).
+
+close(Pid, From, Timeout)  ->
+    do_close(Pid, From, Timeout).
+
 execute(Pid, Name, Version, Params, From) ->
     execute(Pid, Name, Version, Params, From, ?DEFAULT_STANDALONE_TIMEOUT).
 
@@ -265,6 +274,8 @@ do_recv(LogFun, RecvPid, SeqNum)  when is_function(LogFun);
     receive
         {mysql_recv, RecvPid, data, Packet, Num} ->
 	    {ok, Packet, Num};
+        {mysql_recv, RecvPid, active_closed} ->
+	    {ok, active_closed};
 	{mysql_recv, RecvPid, closed, _E} ->
 	    {error, io_lib:format("mysql_recv: socket was closed ~p", [_E])}
     end;
@@ -275,12 +286,35 @@ do_recv(LogFun, RecvPid, SeqNum) when is_function(LogFun);
     receive
         {mysql_recv, RecvPid, data, Packet, ResponseNum} ->
 	    {ok, Packet, ResponseNum};
+        {mysql_recv, RecvPid, active_closed} ->
+	    {ok, active_closed};
 	{mysql_recv, RecvPid, closed, _E} ->
 	    {error, io_lib:format("mysql_recv: socket was closed ~p", [_E])}
     end.
 
 do_fetch(Pid, Queries, From, Timeout) ->
     send_msg(Pid, {fetch, Queries, From}, From, Timeout).
+
+do_close(Pid, From, Timeout) ->
+    send_msg(Pid, {close, From}, From, Timeout).
+
+send_msg(Pid, {close, _} = Msg, From, Timeout) ->
+    Self = self(),
+    Pid ! Msg,
+    case From of
+	Self ->
+	    %% We are not using a mysql_dispatcher, await the response
+	    receive
+		{closed, Pid} ->
+		    closed
+	    after Timeout ->
+		    {error, "message timed out"}
+	    end;
+	_ ->
+	    %% From is gen_server From,
+	    %% Pid will do gen_server:reply() when it has an answer
+	    ok
+    end;
 
 send_msg(Pid, Msg, From, Timeout) ->
     Self = self(),
@@ -378,6 +412,8 @@ loop(State) ->
 	{fetch, Queries, From} ->
 	    send_reply(From, do_queries(State, Queries)),
 	    loop(State);
+	{close, From} ->
+	    send_reply(From, do_active_close(State));
 	{transaction, Fun, From} ->
 	    put(?STATE_VAR, State),
 
@@ -416,7 +452,14 @@ loop(State) ->
 %% or a pid if no gen_server was used to make the query
 send_reply(GenSrvFrom, Res) when is_pid(GenSrvFrom) ->
     %% The query was not sent using gen_server mechanisms       
-    GenSrvFrom ! {fetch_result, self(), Res};
+    case Res of
+        {error, Msg} ->
+            GenSrvFrom ! {error, self(), Msg};
+        {ok, closed} ->
+            GenSrvFrom ! {closed, self()};
+        _ ->
+            GenSrvFrom ! {fetch_result, self(), Res}
+    end;
 send_reply(GenSrvFrom, Res) ->
     gen_server:reply(GenSrvFrom, Res).
 
@@ -465,6 +508,28 @@ do_queries(Sock, RecvPid, LogFun, Queries, Version) ->
 		      Res -> Res
 		  end
 	  end, ok, Queries).
+
+do_active_close(State) ->
+    do_active_close(State#state.socket,
+	       State#state.recv_pid,
+	       State#state.log_fun
+	      ).
+
+do_active_close(Sock, RecvPid, LogFun) ->
+    ?Log2(LogFun, debug, "close (id ~p)", [RecvPid]),
+    Packet =  <<?MYSQL_CLOSE_OP>>,
+    RecvPid ! {close, self()},
+    Res = case do_send(Sock, Packet, 0, LogFun) of
+	ok ->
+	    get_close_response(LogFun,RecvPid);
+	{error, Reason} ->
+	    Msg = io_lib:format("Failed active close "
+				"on socket : ~p",
+				[Reason]),
+	    {error, Msg}
+    end,
+    gen_tcp:close(Sock),
+    Res.
 
 do_transaction(State, Fun) ->
     case do_query(State, <<"BEGIN">>) of
@@ -685,6 +750,13 @@ get_query_response(LogFun, RecvPid, Version) ->
 	    {error, #mysql_result{error=Reason}}
     end.
 
+get_close_response(LogFun, RecvPid) ->
+    case do_recv(LogFun, RecvPid, undefined) of
+        {ok, active_closed} ->
+	    {ok, closed};
+        {error, Reason} ->
+	    {error, #mysql_result{error=Reason}}
+    end.
 %%--------------------------------------------------------------------
 %% Function: get_fields(LogFun, RecvPid, [], Version)
 %%           LogFun  = undefined | function() with arity 3

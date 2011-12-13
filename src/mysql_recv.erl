@@ -38,7 +38,8 @@
 	  socket,
 	  parent,
 	  log_fun,
-	  data
+	  data,
+	  closed = 0
 	 }).
 
 -define(SECURE_CONNECTION, 32768).
@@ -138,14 +139,27 @@ loop(State) ->
 		   end),
 	    State#state.parent ! {mysql_recv, self(), closed, {error, Reason}},
 	    error;
+	{close, From} ->
+	    LogFun = State#state.log_fun,
+	    LogFun(?MODULE, ?LINE, debug,
+		   fun() ->
+			   {"mysql_recv: ~p close socket ~p actively", [From, Sock]}
+		   end),
+	    loop(State#state{closed = 1});
 	{tcp_closed, Sock} ->
 	    LogFun = State#state.log_fun,
 	    LogFun(?MODULE, ?LINE, debug,
 		   fun() ->
 			   {"mysql_recv: Socket ~p closed", [Sock]}
 		   end),
-	    State#state.parent ! {mysql_recv, self(), closed, normal},
-	    error
+	    case State#state.closed =:= 1 of
+	        true ->
+		    State#state.parent ! {mysql_recv, self(), active_closed},
+		    ok;
+	        false ->
+		    State#state.parent ! {mysql_recv, self(), closed, normal},
+	            error
+	    end
     end.
 
 %%--------------------------------------------------------------------
